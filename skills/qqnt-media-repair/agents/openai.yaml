@@ -1,0 +1,4 @@
+interface:
+  display_name: "QQ媒体批量修复"
+  short_description: "识别QQ聊天媒体假过期，验证样本后批量修复本地关联并保留回滚记录"
+  default_prompt: "使用 $qqnt-media-repair 检查QQ媒体假过期，验证样本后批量修复全部同类可恢复记录。"

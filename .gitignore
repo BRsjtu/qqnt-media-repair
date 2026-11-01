@@ -1,0 +1,26 @@
+# Private QQ data and account material
+**/nt_msg.db
+**/nt_msg.db-*
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite-*
+**/*.sqlite3
+**/*.sqlite3-*
+**/*.key
+**/*.keyfile
+**/*keyfile*
+
+# Local repair artifacts
+runs/
+run-*/
+reports/
+snapshots/
+rollback/
+*.rollback
+*.snapshot
+*.report.json
+__pycache__/
+*.py[cod]
+.venv/
+dist/
