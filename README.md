@@ -1,8 +1,8 @@
 # QQNT 媒体修复
 
-这是一个仅在本地运行、面向批量处理的工具和 Codex skill，用于在本地原件仍存在时，修复范围有限且明确的旧版 QQNT 文件卡片媒体记录。
+这是一个仅在本地运行、面向批量处理的工具和 Codex skill，用于在本地原件仍存在时，修复符合已验证规则的 QQNT 媒体引用或缺失路径。
 
-它不是通用 QQ 媒体恢复工具，也不承诺所有过期或缺失项目都能恢复。当前初始支持范围仅限 skill 中[兼容性说明](skills/qqnt-media-repair/references/compatibility.md)所述的旧版 `FILE` 卡片布局。
+当前支持旧版 `FILE` 卡片引用修正，以及普通图片原件仍在、明确引用路径缺失时的文件补回；具体边界见[兼容性说明](skills/qqnt-media-repair/references/compatibility.md)。其他图片、视频、语音可清点，但不承诺所有过期或缺失项目都能恢复。
 
 ## 工作流
 
@@ -28,9 +28,34 @@ uv run --python 3.13 --with sqlcipher3==0.6.4 -- python $script rollback --run $
 
 `scan` 可加 `--extra-root` 纳入其他本地下载目录；`--existing-index` 可复用兼容的文件清单，但选中的文件仍会核对实际内容。`confirm-ui` 是操作者对原生 QQ 界面结果的确认，不是工具自动验证界面的证明。此前已在同一数据库和版本验证过相同规则时，可用 `--existing-cases` 记录已有验证。
 
-每个操作至多建立一份临时数据库副本，结束后自动清理；原始媒体文件不复制。运行目录保留加密的受影响行计划及回滚数据、私有索引和报告。不要在仓库内创建运行目录。
+每个数据库操作至多建立一份临时数据库副本，结束后自动清理。文件卡片引用修正不复制原始媒体；下述路径补回会按计划创建缺失文件，并报告新增空间。运行目录保留加密的受影响行计划及回滚数据、私有索引和报告。不要在仓库内创建运行目录。
 
 在 QQ 中用 1–2 条原始文件卡片确认配置文件后，工作流应继续处理全部合格记录。样本检查不是停下等待逐条授权的理由，只要用户已授权本次修复任务。报告应分别统计已修复并经 UI 验证的记录、跳过、失败和未处理媒体。
+
+### Profile 2：按明确本地路径补回已验证图片
+
+`restore_media_paths.py` 是独立的路径补回辅助工具，不改消息数据库。它只处理元数据快照中明确缺失的图片原件路径，并从已验证本地来源逐次核验大小、MD5 和 SHA256 后原字节复制。默认仅生成 dry-run 清单；`--apply` 才创建目标文件，默认新增总量上限为 2 GiB，目标已存在时不会覆盖。预览缓存必须显式启用，且只接受原件也明确缺失的同一图片记录和元数据声明路径；使用 `--include-declared-previews` 时需安装 Pillow 以验证图片可解码。预览仍按原件字节复制，不做转码。工具结果不代表 QQ 界面已验证。
+
+```powershell
+$scan = '.\skills\qqnt-media-repair\scripts\broad_media_scan.py'
+$restore = '.\skills\qqnt-media-repair\scripts\restore_media_paths.py'
+$account = 'D:\QQ\YOUR_ACCOUNT'
+$run = 'D:\QQRepairRuns\broad-001'
+$key = 'D:\Private\qq.key'
+# 退出 QQ 后清点所有普通图片、文件、语音和视频。未知类别只报告，不自动修改。
+uv run --python 3.13 --with sqlcipher3==0.6.4 -- python $scan --account $account --key-file $key --run $run --qq-stopped --timeout-seconds 0
+$metadata = "$run\media-metadata.private.sqlite"
+$out = 'D:\Private\restore-plan.private.json'
+uv run --python 3.13 -- python $restore --metadata-db $metadata --account $account --out $out
+# 核实一两个原聊天案例后，对同类目标批量执行：
+uv run --python 3.13 -- python $restore --metadata-db $metadata --account $account --out $out --apply
+# 显式补回同一批记录声明的缺失预览；已有预览保留原字节。
+uv run --python 3.13 --with pillow -- python $restore --metadata-db $metadata --account $account --out $out --include-declared-previews --apply
+```
+
+输入是只读 metadata snapshot，至少包含 `restore_targets`、`verified_sources`、`verified_refs`、`blocked_restore_paths` 和 `restore_target_conflicts` 表。完整预览清单可通过 `declared_restoration_previews(path,source_id,field,table_code,msg_id,segment_path)` 提供；若无此表，工具只使用明确标记原件缺失的受限 examples 回退集。不要把数据库快照或清单提交到仓库。
+
+扫描过总消息数不代表每种媒体都已验证可用。第一条规则仅处理旧 FILE 卡片，不能用它的“零新增”推断普通图片、视频、语音也没有问题；应使用广域清点并分别报告覆盖范围、补回路径、保留或跳过的项目及实际 QQ 抽查结果。
 
 ## 安装 Codex skill
 

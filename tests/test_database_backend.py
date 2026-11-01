@@ -119,6 +119,16 @@ class CipherTests(unittest.TestCase):
     def update(self, old=b"before-one", new=b"after-one"):
         return {"table": "c2c_msg_table", "msg_id": 1, "old_body": old, "new_body": new}
 
+    def test_insufficient_space_refuses_before_copy(self):
+        from unittest import mock
+        with mock.patch.object(backend.shutil, "disk_usage") as usage:
+            usage.return_value.free = 0
+            with self.assertRaisesRegex(backend.BackendError, "insufficient_working_drive_space"):
+                with backend.staged_database(self.db, self.key, self.work):
+                    self.fail("insufficient disk space must refuse the snapshot")
+        self.assertEqual(self.db.read_bytes(), self.main)
+        self.assertFalse(list(self.work.glob("ntqq-stage-*")))
+
     def test_scan_lock_readonly_and_cleanup(self):
         with backend.staged_database(self.db, self.key, self.work) as stage:
             stage_path = stage.path

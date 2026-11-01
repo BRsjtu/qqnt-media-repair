@@ -478,6 +478,10 @@ def staged_database(db_path, key_file, work_dir):
             raise BackendError("database_too_short")
         wal = _read_optional(str(db_path) + "-wal")
         shm = _read_optional(str(db_path) + "-shm")
+        reserve = max(1024 * 1024 * 1024, main_signature["size"] // 20)
+        needed = main_signature["size"] - HEADER_SIZE + len(wal) + reserve
+        if shutil.disk_usage(work_dir).free < needed:
+            raise BackendError("insufficient_working_drive_space")
         prefix_wal, wal_info = committed_wal(wal)
         source = {"main": main_signature, "wal": stat_signature(str(db_path) + "-wal"),
                   "wal_sha256": sha256(wal), "wal_info": wal_info,
