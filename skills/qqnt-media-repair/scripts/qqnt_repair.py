@@ -83,7 +83,7 @@ def scan(args):
     plan = run / "plan.sqlite"
     if plan.exists():
         raise ValueError("a plan already exists; select a new run directory")
-    counts = Counter()
+    counts = Counter({"planned_rows": 0, "planned_segments": 0})
     # Field 45002, varint value 3. This broad SQL byte filter includes mixed
     # messages; the bounded parser then checks every 40800 segment exactly.
     file_tag = bytes.fromhex("d0fc1503")
@@ -204,6 +204,16 @@ def apply(args, rollback=False):
         entries = plan.execute("SELECT table_name,msg_id,old_body,new_body,identity_hash,sources FROM repairs ORDER BY table_name,msg_id").fetchall()
         if args.sample and not rollback:
             entries = entries[:args.sample]
+        if not entries:
+            action = "rollback" if rollback else ("sample" if args.sample else "bulk")
+            result = {"published": False, "reason": "no eligible rows with verified local originals"}
+            summary = {"phase": action + "_complete", "counts": {"updated_rows": 0}, "database_result": result}
+            meta_set(plan, "last_" + action, {"time": now(), "counts": {"updated_rows": 0}, "database_result": result})
+            event(plan, action, {"updated_rows": 0})
+            plan.commit()
+            (run / (action + "-result.json")).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+            emit(summary)
+            return
         allowed = [account.resolve(strict=True)] + [Path(p).resolve(strict=True) for p in meta_get(plan, "extra_roots")]
         updates, checked, counts = [], set(), Counter()
         with staged_database(database, args.key_file, run) as stage:
