@@ -27,7 +27,7 @@ MAX_TEXT = 4096
 MEDIA_TYPES = {2: "image", 3: "file", 4: "voice", 5: "video"}
 FAILURE_TEXT = "传输失败，请稍后重试".encode("utf-8")
 _HEX32 = re.compile(rb"[0-9a-fA-F]{32}\Z")
-_ALLOW = {45002, 45003, 45402, 45403, 45405, 45406, 45407, 45408,
+_ALLOW = {45002, 45003, 45402, 45403, 45404, 45405, 45406, 45407, 45408,
           45418, 45422, 45424, 45507, 45509, 45526, 45554,
           45812, 45814, 45862, 47710}
 
@@ -154,7 +154,8 @@ def extract_media(blob):
     count occurrences of 47710. `nested_reference` distinguishes quoted media.
     Metadata is for LOCAL use. Never publish private filenames, paths, or content hashes.
     `local_path` prefers 45403, then 45812, then 45814; inspect `local_paths` to
-    distinguish sent originals from cached thumbs. No existence checks occur.
+    distinguish sent originals from cached thumbs. Video records additionally
+    expose the explicitly declared 45404 cover path. No existence checks occur.
     """
     stats = {"status": "null" if blob is None else "ok", "message_segments": 0,
              "media_segments": 0, "parse_failed": 0, "bounded_out": 0,
@@ -205,10 +206,13 @@ def extract_media(blob):
             canonical_legacy = set(hashes["45406"] + hashes["45407"])
             conflict = len(canonical_legacy) > 1
             paths = {}
-            for number in (45403, 45812, 45814):
+            invalid_local_path_fields = {}
+            path_fields = (45403, 45812, 45814, 45404) if content_type == 5 else (45403, 45812, 45814)
+            for number in path_fields:
                 paths[str(number)] = vals(number, _path)
-                stats["unsafe_path_fields"] += sum(
-                    w == 2 and _path(v) is None for w, v in fields.get(number, []))
+                invalid_local_path_fields[str(number)] = sum(
+                    w != 2 or _path(v) is None for w, v in fields.get(number, []))
+                stats["unsafe_path_fields"] += invalid_local_path_fields[str(number)]
             primary = hashes["45406"] or hashes["45407"]
             # 45424 is documented as IMAGE hash; do not use it as FILE MD5.
             if not primary and content_type == 2:
@@ -258,6 +262,7 @@ def extract_media(blob):
                                          canonical_legacy != set(hashes["45424"])),
                 "reference_md5s": ref_md5,
                 "local_path": all_paths[0] if all_paths else None, "local_paths": paths,
+                "invalid_local_path_fields": invalid_local_path_fields,
                 "thumbnail_hashes": vals(45408, _thumbnail_hash),
                 "video_thumbnail_hashes": vals(45862, _md5),
                 "cover_names": vals(45422, lambda v: _filename(v) or

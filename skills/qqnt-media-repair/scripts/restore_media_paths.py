@@ -66,7 +66,12 @@ def _validate_windows_components(raw: str):
             raise ValueError("reserved_windows_name")
 
 
-def _target_policy(raw: str, account: Path, *, preview=False) -> Path:
+MEDIA_KINDS={"image":2,"file":3,"video":5}
+IMAGE_EXTS={".jpg",".jpeg",".png",".gif",".webp",".bmp"}
+VIDEO_EXTS={".mp4",".mov",".m4v",".webm",".mkv",".avi",".wmv",".flv",".ts",".mts",".3gp"}
+
+
+def _target_policy(raw: str, account: Path, *, kind="image", preview=False) -> Path:
     _validate_windows_components(raw)
     p = Path(raw)
     if not p.is_absolute() or ".." in p.parts or "\x00" in raw:
@@ -78,12 +83,18 @@ def _target_policy(raw: str, account: Path, *, preview=False) -> Path:
     parts = [x.casefold() for x in rel.parts]
     if len(parts) < 6 or parts[:2] != ["nt_qq", "nt_data"]:
         raise ValueError("target_outside_nt_media")
-    if parts[2] not in {"pic", "emoji"}:
+    roots={"image":{"pic","emoji"},"video":{"video"},"file":{"file"}}
+    if kind not in roots or parts[2] not in roots[kind]:
         raise ValueError("target_not_allowed_kind")
     expected_parent = "thumb" if preview else "ori"
     if expected_parent not in parts[3:-1]:
         raise ValueError("target_wrong_media_directory")
-    if preview and Path(rel).suffix.casefold() not in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+    suffix=Path(rel).suffix.casefold()
+    if kind=="image" and not preview and suffix not in IMAGE_EXTS:
+        raise ValueError("unsupported_image_extension")
+    if kind=="video" and suffix not in VIDEO_EXTS:
+        raise ValueError("unsupported_video_extension")
+    if preview and (kind!="image" or suffix not in IMAGE_EXTS):
         raise ValueError("preview_extension_not_image")
     return _assert_tree(q, account, allow_missing=True)
 
@@ -177,7 +188,7 @@ def _image_decodes(path: Path):
         image.verify()
 
 
-def _read_plan(db_path: Path, account: Path, only_msg_id=None, include_previews=False):
+def _read_plan(db_path: Path, account: Path, only_msg_id=None, include_previews=False, media_kinds=("image",)):
     uri = db_path.resolve(strict=True).as_uri() + "?mode=ro"
     db = sqlite3.connect(uri, uri=True)
     db.row_factory = sqlite3.Row
@@ -193,18 +204,24 @@ def _read_plan(db_path: Path, account: Path, only_msg_id=None, include_previews=
         if not columns <= actual:
             db.close()
             raise ValueError("metadata_schema_mismatch")
+    selected=tuple(k for k in MEDIA_KINDS if k in media_kinds)
+    if not selected:
+        db.close()
+        return [],0
+    kind_ids=tuple(MEDIA_KINDS[k] for k in selected)
     query = """SELECT t.*,s.size AS source_size,s.md5 AS source_md5,
                       s.sha256 AS source_sha256,s.path AS source_path
                  FROM restore_targets t JOIN verified_sources s USING(source_id)
-                 WHERE t.kind=2 AND t.field=45403"""
-    args = []
+                 WHERE t.kind IN ({}) AND t.field=45403""".format(",".join("?" for _ in kind_ids))
+    args = list(kind_ids)
     if only_msg_id is not None:
         query += " AND t.msg_id=?"
         args.append(only_msg_id)
     query += " ORDER BY t.path"
     targets = []
     for row in db.execute(query, args):
-        path = _target_policy(row["path"], account)
+        kind_name=next(k for k,v in MEDIA_KINDS.items() if v==row["kind"])
+        path = _target_policy(row["path"], account,kind=kind_name)
         if row["source_size"] != row["expected_size"] or row["source_md5"].lower() != row["expected_md5"].lower():
             continue
         if db.execute("SELECT 1 FROM blocked_restore_paths WHERE path=?", (row["path"],)).fetchone():
@@ -212,16 +229,17 @@ def _read_plan(db_path: Path, account: Path, only_msg_id=None, include_previews=
         if db.execute("SELECT 1 FROM restore_target_conflicts WHERE path=?", (row["path"],)).fetchone():
             continue
         ref = db.execute("""SELECT 1 FROM verified_refs WHERE table_code=? AND msg_id=?
-                            AND segment_path=? AND source_id=? AND kind=2 AND nested=0 LIMIT 1""",
-                         (row["table_code"], row["msg_id"], row["segment_path"], row["source_id"])).fetchone()
+                            AND segment_path=? AND source_id=? AND kind=? AND nested=0 LIMIT 1""",
+                         (row["table_code"], row["msg_id"], row["segment_path"], row["source_id"],row["kind"])).fetchone()
         if not ref:
             continue
         targets.append({"target": str(path), "source": row["source_path"], "size": row["source_size"],
                         "md5": row["source_md5"].lower(), "sha256": row["source_sha256"].lower(),
                         "msg_id": row["msg_id"], "field": row["field"], "kind": row["kind"],
                         "table_code": row["table_code"], "segment_path": row["segment_path"],
+                        "media_kind":kind_name,
                         "preview": False})
-    if include_previews:
+    if include_previews and "image" in selected:
         has_declared = "declared_restoration_previews" in {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if has_declared:
             pvcols={r[1] for r in db.execute("PRAGMA table_info(declared_restoration_previews)")}
@@ -246,14 +264,15 @@ def _read_plan(db_path: Path, account: Path, only_msg_id=None, include_previews=
                 pvq += " AND p.msg_id=?"; pva.append(only_msg_id)
             for row in db.execute(pvq, pva):
                 try:
-                    op = _target_policy(row["original_path"], account)
+                    op = _target_policy(row["original_path"], account,kind="image")
                     if not _matches_source_if_present(op,row):
                         continue
-                    path = _target_policy(row["path"], account, preview=True)
+                    path = _target_policy(row["path"], account,kind="image",preview=True)
                     targets.append({"target":str(path),"source":row["source_path"],"size":row["size"],
                                     "md5":row["md5"].lower(),"sha256":row["sha256"].lower(),
                                     "msg_id":row["msg_id"],"field":row["field"],"kind":2,
-                                    "table_code":row["table_code"],"segment_path":row["segment_path"],"preview":True})
+                                    "table_code":row["table_code"],"segment_path":row["segment_path"],
+                                    "media_kind":"image","preview":True})
                 except (OSError, ValueError):
                     continue
         else:
@@ -277,13 +296,13 @@ def _read_plan(db_path: Path, account: Path, only_msg_id=None, include_previews=
                           AND t.expected_size=? AND lower(t.expected_md5)=lower(?)""",
                         (src[0],int(item["id"]),meta["segment_path"],source["size"],source["md5"])).fetchall()
                     for ref in refs:
-                        if not _matches_source_if_present(_target_policy(ref["path"],account),source):
+                        if not _matches_source_if_present(_target_policy(ref["path"],account,kind="image"),source):
                             continue
                         for declared in item.get("path_status",[]):
                             if declared.get("field") not in {"45812","45814"} or not declared.get("is_thumbnail_path") or declared.get("status")!="missing" or not declared.get("resolved_path"):
                                 continue
-                            path=_target_policy(declared["resolved_path"],account,preview=True)
-                            targets.append({"target":str(path),"source":source["path"],"size":source["size"],"md5":source["md5"].lower(),"sha256":source["sha256"].lower(),"msg_id":int(item["id"]),"field":int(declared["field"]),"kind":2,"table_code":ref[1],"segment_path":ref[3],"preview":True})
+                            path=_target_policy(declared["resolved_path"],account,kind="image",preview=True)
+                            targets.append({"target":str(path),"source":source["path"],"size":source["size"],"md5":source["md5"].lower(),"sha256":source["sha256"].lower(),"msg_id":int(item["id"]),"field":int(declared["field"]),"kind":2,"media_kind":"image","table_code":ref[1],"segment_path":ref[3],"preview":True})
                 except (KeyError,TypeError,ValueError,json.JSONDecodeError):
                     continue
     db.close()
@@ -375,7 +394,9 @@ def run(args):
         raise ValueError("account_not_directory")
     roots = _source_roots(account)
     aliases = getattr(args, "source_alias", ())
-    plans, identity_conflicts = _read_plan(args.metadata_db, account, args.only_msg_id, args.include_declared_previews)
+    media_kinds=getattr(args,"media_kinds",("image",))
+    plans, identity_conflicts = _read_plan(args.metadata_db, account, args.only_msg_id,
+                                           args.include_declared_previews,media_kinds)
     outcomes = []
     bytes_to_add = 0
     for p in plans:
@@ -444,6 +465,11 @@ def run(args):
         if item.get("error"):
             ent["error"] = item["error"]
         manifest["items"].append(ent)
+    manifest["counts_by_media_kind"]={}
+    for item in outcomes:
+        kind=item["plan"]["media_kind"]
+        per=manifest["counts_by_media_kind"].setdefault(kind,{})
+        per[item["status"]]=per.get(item["status"],0)+1
     manifest["source_original_paths"] = sum(1 for x in outcomes if not x["plan"]["preview"] and x["status"] == "created")
     manifest["source_originals_already_present"] = sum(1 for x in outcomes if not x["plan"]["preview"] and x["status"] == "already_present")
     manifest["cache_previews_filled"] = sum(1 for x in outcomes if x["plan"]["preview"] and x["status"] == "created")
@@ -456,7 +482,8 @@ def run(args):
     print(json.dumps({"mode":manifest["mode"],"counts":manifest["counts"],"bytes_to_add":verified_bytes_to_add,
                       "source_original_paths":manifest["source_original_paths"],"cache_previews_filled":manifest["cache_previews_filled"],
                       "cache_previews_preserved":manifest["cache_previews_preserved"],"ui_verified":0,
-                      "budget_ok":budget_ok,"identity_conflicts_excluded":identity_conflicts},separators=(",",":")))
+                      "counts_by_media_kind":manifest["counts_by_media_kind"],"budget_ok":budget_ok,
+                      "identity_conflicts_excluded":identity_conflicts},separators=(",",":")))
     failed = any(x["status"] in {"apply_failed","not_attempted","source_verification_failed","exists_different","target_unreadable"} for x in outcomes)
     return 3 if failed else (0 if budget_ok else 2)
 
@@ -470,10 +497,16 @@ def main():
     p.add_argument("--max-added-mib",type=int,default=2048)
     p.add_argument("--only-msg-id",type=int)
     p.add_argument("--include-declared-previews",action="store_true")
+    p.add_argument("--media-kinds",default="image",help="experimental opt-in: comma-separated image,video,file; default: image; no UI compatibility is implied")
     p.add_argument("--source-alias",action="append",default=[],help="optional path alias; must resolve exactly to --account")
     a=p.parse_args()
     if a.max_added_mib < 0:
         p.error("--max-added-mib must be nonnegative")
+    a.media_kinds=tuple(dict.fromkeys(x.strip().lower() for x in a.media_kinds.split(",") if x.strip()))
+    if not a.media_kinds or any(k not in MEDIA_KINDS for k in a.media_kinds):
+        p.error("--media-kinds must contain image, video, and/or file")
+    if a.include_declared_previews and "image" not in a.media_kinds:
+        p.error("--include-declared-previews requires image in --media-kinds")
     try:
         return run(a)
     except Exception as exc:

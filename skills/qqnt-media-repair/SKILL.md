@@ -1,11 +1,11 @@
 ---
 name: qqnt-media-repair
-description: 基于本地已验证的原始文件，清点 QQNT 图片、文件、语音和视频，批量修复符合条件的旧文件卡片或普通图片缺失路径。适用于清点、计划、修复、验证或回滚；不应假定所有过期或缺失项目都能恢复。
+description: 基于本地已验证的原始文件，清点 QQNT 图片、文件、语音和视频，批量修复符合条件的旧文件卡片或明确缺失的原件路径。适用于清点、计划、修复、验证或回滚；不应假定所有过期或缺失项目都能恢复。
 ---
 
 # QQNT 媒体批量修复
 
-入口为 `scripts/qqnt_repair.py`，先运行 `--help`。此 skill 面向批量修复：在 QQ 中确认 1–2 条原始文件卡片后，应继续处理已验证配置文件下的全部合格记录，不能把流程缩成逐条修复。
+数据库修复入口为 `scripts/qqnt_repair.py`，先运行 `--help`。默认 profile 是 `legacy-file-subtype1-ascii-md5-failed-v1`。`legacy-file-subtype7-v1` 必须在 `scan` 时显式传 `--profile legacy-file-subtype7-v1`，独立建计划；不会改变默认值。Subtype 7 已有数据库完整性检查和一条原聊天 PDF 卡片成功打开本地 PDF 的代表案例；页面内容未目视确认，不外推至其他格式。此 skill 面向批量修复：在 QQ 中确认代表卡片后，应继续处理获授权、符合该 profile 的记录，不能把流程缩成逐条修复。
 
 执行依赖为 Windows x64、Python 3.13、已核验二进制的 `sqlcipher3==0.6.4`，可使用 `uv run --python 3.13 --with sqlcipher3==0.6.4 -- python <脚本路径> ...`。命令顺序为 `scan` → `apply --sample 1`（或 2）→ 打开 QQ 实测并退出 → `confirm-ui` → `apply` 批量处理 → `status`。`rollback` 根据加密计划做有条件的行级逆向恢复。已有同机同版实测时，`confirm-ui --existing-cases` 可复用证据，避免重复抽样修改。各命令用 `--help` 查看必填参数。
 
@@ -13,11 +13,11 @@ description: 基于本地已验证的原始文件，清点 QQNT 图片、文件�
 
 新增只读清点入口为 `scripts/broad_media_scan.py`。它检查单聊和群聊中的图片、文件、语音、视频，以及有明确 schema 的引用媒体；必须传入本机 `--account`、`--key-file`、仓库外的 `--run`，并先退出 QQ、使用 `--qq-stopped` 确认。`--db` 默认账号目录中的 `nt_qq/nt_db/nt_msg.db`。可选 `--index`、`--content-hashes` 只作为候选提示；不提供旧索引时会建立本机清单。候选仍须用实际字节验证大小、MD5 和 SHA-256。默认会将存在的当前用户 Downloads 纳入来源范围。
 
-该入口只保存本机元数据、已验证来源及明确缺失的 `Ori` 路径，不修改聊天数据库或自动复制文件。命名配置 `explicit-image-media-path-rehydration-v1` 的已验证范围见兼容性说明；不能把所有 missing cache 算作损坏。`--path-alias` 可重复提供真实目录别名，仅当其解析结果与账号根目录相同才接受；默认也会验证当前用户 `Documents/Tencent Files/<账号目录名>` 是否为真实别名，不按盘符猜测映射。
+该入口只保存本机元数据、已验证来源及明确缺失的 `Ori` 路径，不修改聊天数据库或自动复制文件。路径补回只可处理工具计划中明确列出的图片、视频或文件原件目标；每项仍须满足已记录路径缺失、身份无歧义、来源原字节可验证等条件。默认只处理图片；视频、文件用 `--media-kinds video,file` 显式 opt-in。图片案例已完成原聊天与查看器验证；视频原件路径补回本身不保证聊天卡片可用。若字段 `45404` 声明的封面缓存也缺失，可用独立的 `scripts/video_cover_repair.py` 从已验证本地 MP4 派生首帧 PNG；在 QQ 9.9.31-49738 的代表案例中，补回此缓存后原聊天封面和播放已验证。该布局结果不能外推为所有版本支持。不能把所有 missing cache 算作损坏。`--path-alias` 可重复提供真实目录别名，仅当其解析结果与账号根目录相同才接受；默认也会验证当前用户 `Documents/Tencent Files/<账号目录名>` 是否为真实别名，不按盘符猜测映射。
 
 默认使用有界快速匹配，未命中标记为 `not_in_fast_index`，不能推断原件丢失；`--exhaustive-size-fallback` 才启用更慢的同大小全面查找。默认 30 分钟超时，或创建 `<run>/STOP`、按 Ctrl+C 时，保存明确标记为不完整的结果并退出临时快照上下文；`--timeout-seconds 0` 可关闭超时。单次清点只创建一份临时大快照。密钥、索引、元数据、报告及媒体始终留在本机，勿上传到公开仓库或问题报告。
 
-用户已授权全量检查且工作盘空间足够时，使用 `--timeout-seconds 0` 完成全量；暂停清点优先创建 STOP 文件以正常收尾。工具或终端被强制停止时，检查是否遗留临时快照，不能再叠加第二份大副本。广域清点后的 `scripts/restore_media_paths.py` 先 dry-run，再按已验证的普通图片路径补回规则批量应用；原件与声明预览分别计数，已有预览保留，不把路径数量当作已逐条验证的聊天数量。
+用户已授权全量检查且工作盘空间足够时，使用 `--timeout-seconds 0` 完成全量；暂停清点优先创建 STOP 文件以正常收尾。工具或终端被强制停止时，检查是否遗留临时快照，不能再叠加第二份大副本。广域清点后的 `scripts/restore_media_paths.py` 先 dry-run，再仅对明确列出的合格原件路径批量应用。对视频，若聊天仍显示过期且 `45404` 声明的封面缓存缺失，再单独用 `video_cover_repair.py` 生成派生首帧图；工具只消费扫描器明确收集的封面目标。按实际创建路径分别计数原件与预览，不把路径数量当作已逐条验证的聊天或独立媒体数量。
 
 ## 必须完成的工作
 

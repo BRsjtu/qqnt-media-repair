@@ -68,10 +68,11 @@ class RestoreToolTests(unittest.TestCase):
         db.commit()
         db.close()
 
-    def args(self, *, apply=False, cap=10):
+    def args(self, *, apply=False, cap=10, media_kinds=("image",), previews=False):
         return type("Args", (), {"metadata_db": self.db_path, "account": self.account,
                                   "out": self.out, "apply": apply, "max_added_mib": cap,
-                                  "only_msg_id": None, "include_declared_previews": False})()
+                                  "only_msg_id": None, "include_declared_previews": previews,
+                                  "media_kinds":media_kinds})()
 
     def test_no_clobber(self):
         dest = self.target_path(1)
@@ -241,6 +242,64 @@ class RestoreToolTests(unittest.TestCase):
                     str(self.account/"nt_qq"/"nt_data"/"Pic"/"bad?name"/"Ori"/"x.jpg")):
             with self.assertRaises(ValueError):
                 restore._target_policy(raw,self.account.resolve())
+
+    def test_video_and_file_targets_require_their_safe_ori_roots(self):
+        video=self.account/"nt_qq"/"nt_data"/"Video"/"2026-02"/"Ori"/"clip.mp4"
+        file=self.account/"nt_qq"/"nt_data"/"File"/"Ori"/"uuid"/"report.pdf"
+        self.add_target(2,path=video,kind=5)
+        self.add_target(3,path=file,kind=3)
+        plans,_=restore._read_plan(self.db_path,self.account,media_kinds=("video","file"))
+        self.assertEqual({p["media_kind"] for p in plans},{"video","file"})
+        self.assertEqual(len(plans),2)
+        image_plans,_=restore._read_plan(self.db_path,self.account)
+        self.assertEqual({p["media_kind"] for p in image_plans},{"image"})
+        self.assertEqual(restore._target_policy(str(video),self.account.resolve(),kind="video"),video)
+        self.assertEqual(restore._target_policy(str(file),self.account.resolve(),kind="file"),file)
+        with self.assertRaises(ValueError):
+            restore._target_policy(str(file),self.account.resolve(),kind="video")
+        with self.assertRaises(ValueError):
+            restore._target_policy(str(video.with_suffix(".jpg")),self.account.resolve(),kind="video")
+
+    def test_video_existing_different_file_is_never_overwritten(self):
+        video=self.account/"nt_qq"/"nt_data"/"Video"/"2026-02"/"Ori"/"clip.mp4"
+        self.add_target(2,path=video,kind=5)
+        video.parent.mkdir(parents=True);video.write_bytes(b"preexisting video")
+        rc=restore.run(self.args(apply=True,media_kinds=("video",)))
+        self.assertEqual(rc,3)
+        self.assertEqual(video.read_bytes(),b"preexisting video")
+        self.assertEqual(json.loads(self.out.read_text())["counts"],{"exists_different":1})
+
+    def test_video_file_plans_require_matching_non_nested_verified_refs(self):
+        video=self.account/"nt_qq"/"nt_data"/"Video"/"2026-02"/"Ori"/"nested.mp4"
+        file=self.account/"nt_qq"/"nt_data"/"File"/"Ori"/"uuid"/"blocked.pdf"
+        self.add_target(2,path=video,kind=5,nested=1)
+        self.add_target(3,path=file,kind=3)
+        db=sqlite3.connect(self.db_path)
+        db.execute("INSERT INTO blocked_restore_paths VALUES (?,?)",(str(file),"test_block"))
+        db.commit();db.close()
+        plans,_=restore._read_plan(self.db_path,self.account,media_kinds=("video","file"))
+        self.assertEqual(plans,[])
+
+    def test_previews_are_excluded_from_video_only_plan(self):
+        video=self.account/"nt_qq"/"nt_data"/"Video"/"2026-02"/"Ori"/"clip.mp4"
+        self.add_target(2,path=video,kind=5)
+        db=sqlite3.connect(self.db_path)
+        preview=self.account/"nt_qq"/"nt_data"/"Pic"/"recv"/"2026-01"/"Thumb"/"2_0.jpg"
+        db.execute("INSERT INTO declared_restoration_previews VALUES (?,?,?,?,?,?)",
+                   (str(preview),1,45812,1,2,"seg/2"))
+        db.commit();db.close()
+        plans,_=restore._read_plan(self.db_path,self.account,include_previews=True,media_kinds=("video",))
+        self.assertEqual(len(plans),1)
+        self.assertFalse(plans[0]["preview"])
+
+    def test_bad_file_source_hash_blocks_apply(self):
+        file=self.account/"nt_qq"/"nt_data"/"File"/"Ori"/"uuid"/"report.pdf"
+        self.add_target(2,path=file,kind=3)
+        self.source.write_bytes(b"changed source")
+        rc=restore.run(self.args(apply=True,media_kinds=("file",)))
+        self.assertEqual(rc,3)
+        self.assertFalse(file.exists())
+        self.assertEqual(json.loads(self.out.read_text())["counts"],{"source_verification_failed":1})
 
 
 if __name__ == "__main__":

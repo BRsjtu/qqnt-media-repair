@@ -7,6 +7,9 @@
 **/*.sqlite-*
 **/*.sqlite3
 **/*.sqlite3-*
+**/*.sqlcipher
+**/*.sqlcipher-*
+**/*.private.*
 **/*.key
 **/*.keyfile
 **/*keyfile*
@@ -19,6 +22,7 @@ snapshots/
 rollback/
 *.rollback
 *.snapshot
+*.bak
 *.report.json
 __pycache__/
 *.py[cod]

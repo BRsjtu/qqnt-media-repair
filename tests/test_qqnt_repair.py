@@ -43,6 +43,15 @@ def file_segment(content, subtype=1):
             + integer(45509, 1) + string(45554, "传输失败，请稍后重试"))
 
 
+def subtype7_segment(content):
+    return (integer(45001, 102) + integer(45002, 3) + integer(45003, 7)
+            + string(45402, "fixture.docx")
+            + string(45403, "::NTOSFull::C:\\Example\\old.docx")
+            + integer(45405, len(content)) + string(45407, hashlib.md5(content).hexdigest())
+            + string(45503, "opaque-subtype7") + integer(45507, (1 << 64) - 7003)
+            + integer(45509, 1) + string(45554, "传输失败，请稍后重试"))
+
+
 HAS_CIPHER = os.name == "nt" and importlib.util.find_spec("sqlcipher3") is not None
 
 
@@ -59,6 +68,8 @@ class CliWorkflowTests(unittest.TestCase):
         self.media.mkdir()
         self.content = b"fixture original content"
         (self.media / "fixture.dat").write_bytes(self.content)
+        self.document = b"synthetic document original"
+        (self.media / "fixture.docx").write_bytes(self.document)
         self.key = self.root / "fixture.key"
         self.key.write_text("fixture-key-1234", encoding="ascii")
         self.run = self.root / "private-run"
@@ -70,7 +81,8 @@ class CliWorkflowTests(unittest.TestCase):
         self.original = {
             "c2c_msg_table": [(1, text + good + unsupported, 11, "keep-a"),
                               (2, good, 12, "keep-b"), (3, missing, 13, "keep-missing"),
-                              (4, unsupported, 14, "keep-unsupported")],
+                              (4, unsupported, 14, "keep-unsupported"),
+                              (5, string(40800, subtype7_segment(self.document)), 15, "keep-subtype7")],
             "group_msg_table": [(10, good + text, 20, "keep-group")],
         }
         builder = self.root / "builder.db"
@@ -96,7 +108,8 @@ class CliWorkflowTests(unittest.TestCase):
 
     def args(self, **values):
         args = dict(account=self.account, db=self.db, run=self.run, key_file=self.key,
-                    qq_build="synthetic-build", extra_root=[], existing_index=None, sample=None)
+                    qq_build="synthetic-build", extra_root=[], existing_index=None, sample=None,
+                    profile=cli.PROFILE, only_msg_id=[])
         args.update(values)
         return SimpleNamespace(**args)
 
@@ -115,7 +128,7 @@ class CliWorkflowTests(unittest.TestCase):
         wal_before = Path(str(self.db) + "-wal").read_bytes()
         summary = self.invoke(cli.scan)[-1]
         self.assertEqual(summary["counts"]["planned_rows"], 3)
-        self.assertEqual(summary["counts"]["unsupported_file_profile"], 2)
+        self.assertEqual(summary["counts"]["unsupported_file_profile"], 3)
         self.assertEqual(summary["counts"]["original_not_matched_in_authorized_roots"], 1)
         self.assertEqual(self.rows(), self.original)
         self.assertEqual(Path(str(self.db) + "-wal").read_bytes(), wal_before)
@@ -181,6 +194,19 @@ class CliWorkflowTests(unittest.TestCase):
         self.assertEqual(self.rows(), self.original)
         self.assertEqual(Path(str(self.db) + "-wal").read_bytes(), wal_before)
         self.assertEqual(self.db.read_bytes(), self.main_before)
+
+    def test_subtype7_profile_is_explicit_and_message_id_scoped(self):
+        summary = self.invoke(cli.scan, profile="legacy-file-subtype7-v1", only_msg_id=[5])[-1]
+        self.assertEqual(summary["profile"], "legacy-file-subtype7-v1")
+        self.assertEqual(summary["counts"]["planned_rows"], 1)
+        self.assertEqual(self.rows(), self.original)
+        with backend.encrypted_archive(self.run / "plan.sqlite", self.key, readonly=True) as plan:
+            self.assertEqual(cli.meta_get(plan, "profile"), "legacy-file-subtype7-v1")
+            self.assertEqual(cli.meta_get(plan, "profile_sha256"), cli.profile_fingerprint("legacy-file-subtype7-v1"))
+            repairs = plan.execute("SELECT msg_id,sources FROM repairs").fetchall()
+            self.assertEqual([row[0] for row in repairs], ["5"])
+            source = json.loads(repairs[0][1])[0]
+            self.assertEqual(source["md5"], hashlib.md5(self.document).hexdigest())
 
 
 if __name__ == "__main__":

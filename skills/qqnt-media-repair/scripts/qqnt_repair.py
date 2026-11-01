@@ -12,10 +12,23 @@ import sys
 
 from database_backend import BackendError, encrypted_archive, staged_database
 from media_profile import ProfileError, inspect_body, normalize_body
+import document_profile
 from source_matcher import SourceMatcher, verify_source
 
 PROFILE = "legacy-file-subtype1-ascii-md5-failed-v1"
+PROFILES = {
+    PROFILE: (inspect_body, normalize_body, (Path(__file__).parent / "media_profile.py",)),
+    document_profile.PROFILE: (document_profile.inspect_body, document_profile.normalize_body,
+                               (Path(__file__).parent / "media_profile.py",
+                                Path(__file__).parent / "document_profile.py")),
+}
 TABLES = ("c2c_msg_table", "group_msg_table")
+
+
+def profile_fingerprint(name):
+    if name not in PROFILES:
+        raise ValueError("unknown profile")
+    return digest(b"\0".join(path.read_bytes() for path in PROFILES[name][2]))
 
 
 def emit(value):
@@ -73,6 +86,11 @@ def validate_layout(account, database):
 
 
 def scan(args):
+    profile = getattr(args, "profile", PROFILE)
+    if profile not in PROFILES:
+        raise ValueError("unknown profile")
+    inspect, normalize, _ = PROFILES[profile]
+    only_ids = sorted({int(value) for value in getattr(args, "only_msg_id", [])})
     account, database = validate_layout(args.account, args.db)
     run = args.run.resolve()
     # Private runtime material must not be written into the source/skill tree.
@@ -90,11 +108,11 @@ def scan(args):
     with staged_database(database, args.key_file, run) as stage:
         with encrypted_archive(plan, args.key_file) as output:
             init_plan(output)
-            meta_set(output, "profile", PROFILE)
+            meta_set(output, "profile", profile)
             meta_set(output, "db", str(database))
             meta_set(output, "account", str(account))
             meta_set(output, "qq_build", args.qq_build)
-            meta_set(output, "profile_sha256", digest((Path(__file__).parent / "media_profile.py").read_bytes()))
+            meta_set(output, "profile_sha256", profile_fingerprint(profile))
             meta_set(output, "source", stage.source)
             meta_set(output, "extra_roots", [str(p.resolve(strict=True)) for p in args.extra_root])
             meta_set(output, "created", now())
@@ -108,7 +126,9 @@ def scan(args):
                     count = stage.connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
                     counts[table + ".total_rows"] = count
                     emit({"phase": "scan_table", "table": table, "total_rows": count})
-                    cur = stage.connection.execute(f'SELECT * FROM "{table}" WHERE instr("40800",?)>0', (file_tag,))
+                    id_filter = (f' AND "40001" IN ({",".join("?" for _ in only_ids)})' if only_ids else "")
+                    cur = stage.connection.execute(f'SELECT * FROM "{table}" WHERE instr("40800",?)>0{id_filter}',
+                                                   (file_tag, *only_ids))
                     columns = [str(c[0]) for c in cur.description]
                     body_i, id_i = columns.index("40800"), columns.index("40001")
                     for row in cur:
@@ -118,7 +138,7 @@ def scan(args):
                             counts["non_blob"] += 1
                             continue
                         try:
-                            inspected = inspect_body(old)
+                            inspected = inspect(old)
                         except ProfileError:
                             counts["malformed_or_bounded_out"] += 1
                             continue
@@ -143,7 +163,7 @@ def scan(args):
                         if not replacements:
                             continue
                         try:
-                            new, changes = normalize_body(old, replacements)
+                            new, changes = normalize(old, replacements)
                         except ProfileError:
                             counts["normalization_rejected"] += 1
                             continue
@@ -162,7 +182,7 @@ def scan(args):
             meta_set(output, "counts", dict(counts))
             event(output, "scan_complete", dict(counts))
             output.commit()
-    summary = {"phase": "scan_complete", "profile": PROFILE, "counts": dict(counts)}
+    summary = {"phase": "scan_complete", "profile": profile, "counts": dict(counts)}
     (run / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     emit(summary)
 
@@ -176,7 +196,7 @@ def confirm_ui(args):
         if not args.existing_cases and not meta_get(plan, "sample_applied"):
             raise ValueError("first apply samples, or explicitly attest previously verified cases")
         proof = {"time": now(), "sample_count": args.sample_count,
-                 "qq_build": meta_get(plan, "qq_build"), "profile": PROFILE,
+                 "qq_build": meta_get(plan, "qq_build"), "profile": meta_get(plan, "profile"),
                  "profile_sha256": meta_get(plan, "profile_sha256"),
                  "evidence": args.evidence, "existing_cases": args.existing_cases}
         meta_set(plan, "ui_confirmation", proof)
@@ -193,9 +213,10 @@ def source_unchanged(source, allowed_roots):
 def apply(args, rollback=False):
     run = args.run.resolve(strict=True)
     with encrypted_archive(run / "plan.sqlite", args.key_file) as plan:
-        if meta_get(plan, "profile") != PROFILE:
+        profile = meta_get(plan, "profile")
+        if profile not in PROFILES:
             raise ValueError("unknown plan profile")
-        if meta_get(plan, "profile_sha256") != digest((Path(__file__).parent / "media_profile.py").read_bytes()):
+        if meta_get(plan, "profile_sha256") != profile_fingerprint(profile):
             raise ValueError("profile changed after planning; rescan")
         database, account = Path(meta_get(plan, "db")), Path(meta_get(plan, "account"))
         validate_layout(account, database)
@@ -275,6 +296,10 @@ def main(argv=None):
     s.add_argument("--qq-build", required=True)
     s.add_argument("--existing-index", type=Path)
     s.add_argument("--extra-root", type=Path, action="append", default=[])
+    s.add_argument("--profile", choices=tuple(PROFILES), default=PROFILE,
+                   help="explicit repair profile; subtype 7 is opt-in")
+    s.add_argument("--only-msg-id", type=int, action="append", default=[],
+                   help="limit scan to one message ID; may be repeated")
     for name in ("confirm-ui", "apply", "rollback", "status"):
         sub.add_parser(name)
     for p in sub.choices.values():

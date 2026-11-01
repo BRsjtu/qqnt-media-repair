@@ -14,6 +14,7 @@ import json
 import ntpath
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import sys
@@ -184,6 +185,10 @@ def init_output(path):
       CREATE TABLE restore_target_conflicts(path TEXT NOT NULL,existing_source_id INTEGER NOT NULL,
         incoming_source_id INTEGER NOT NULL,table_code INTEGER NOT NULL,msg_id INTEGER NOT NULL,
         segment_path TEXT NOT NULL);
+      CREATE TABLE video_cover_targets(target_path TEXT PRIMARY KEY COLLATE NOCASE,
+        original_path TEXT NOT NULL,source_id INTEGER NOT NULL,table_code INTEGER NOT NULL,
+        msg_id INTEGER NOT NULL,segment_path TEXT NOT NULL,expected_size INTEGER NOT NULL,
+        expected_md5 TEXT NOT NULL);
     ''')
     return con
 
@@ -228,6 +233,127 @@ def save_restore_targets(out, record, statuses, source_id, table_code, mid, acco
                         (target, source_id, 45403, table_code, mid, compact(record["segment_path"]),
                          KINDS[record["media_type"]], record["size"], record["md5"]))
             counts["restore_targets.active_unique_paths"] += 1
+
+
+def save_video_cover_targets(out, record, statuses, source_id, table_code, mid, account, counts):
+    """Collect video covers only when 45404 explicitly names the canonical cache path."""
+    if (record.get("media_type")!="video" or record.get("nested_reference") or
+        any(record.get(k) for k in ("md5_conflict","size_conflict","type_conflict"))):
+        counts["video_cover_targets.excluded_type_nested_or_conflicting"]+=1
+        return
+    invalid_paths=record.get("invalid_local_path_fields",{})
+    if any(invalid_paths.get(field,0) for field in ("45403","45404")):
+        counts["video_cover_targets.excluded_invalid_declared_path"]+=1
+        return
+    md5=record.get("md5")
+    size=record.get("size")
+    if not isinstance(md5,str) or not re.fullmatch(r"[0-9a-fA-F]{32}",md5) or type(size) is not int or size<0:
+        counts["video_cover_targets.excluded_invalid_source_metadata"]+=1
+        return
+    verified=out.execute("SELECT size,md5 FROM verified_sources WHERE source_id=?",(source_id,)).fetchone()
+    if not verified or verified[0]!=size or str(verified[1]).casefold()!=md5.casefold():
+        counts["video_cover_targets.excluded_unverified_source_identity"]+=1
+        return
+    base=account/"nt_qq"/"nt_data"
+    def declared_paths(field):
+        found=[]
+        for status in statuses:
+            if status.get("field")!=field:
+                continue
+            raw=status.get("resolved_path")
+            if status.get("status") not in {"exists","missing"} or not isinstance(raw,str):
+                return None
+            path=Path(raw)
+            try:
+                path.relative_to(base)
+            except ValueError:
+                counts["video_cover_targets.excluded_outside_account"]+=1
+                return None
+            key=ntpath.normcase(ntpath.normpath(str(path)))
+            if all(ntpath.normcase(ntpath.normpath(str(prior)))!=key for prior in found):
+                found.append(path)
+        return found
+    originals=declared_paths("45403")
+    covers=declared_paths("45404")
+    if not originals or not covers:
+        counts["video_cover_targets.excluded_missing_declared_path"]+=1
+        return
+    if len(originals)!=1 or len(covers)!=1:
+        counts["video_cover_targets.excluded_conflicting_declared_paths"]+=1
+        return
+    original,declared_cover=originals[0],covers[0]
+    try:
+        rel=original.relative_to(base)
+    except ValueError:
+        counts["video_cover_targets.excluded_outside_account"]+=1
+        return
+    parts=rel.parts
+    if (len(parts)!=4 or parts[0].casefold()!="video" or
+        not re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])",parts[1]) or
+        parts[2].casefold()!="ori" or original.suffix.casefold()!=".mp4" or
+        original.stem.casefold()!=md5.casefold()):
+        counts["video_cover_targets.excluded_noncanonical_original_path"]+=1
+        return
+    month=parts[1]
+    target=base/"Video"/month/"Thumb"/(md5.lower()+"_0.png")
+    if ntpath.normcase(ntpath.normpath(str(declared_cover)))!=ntpath.normcase(ntpath.normpath(str(target))):
+        counts["video_cover_targets.excluded_noncanonical_declared_cover_path"]+=1
+        return
+    original_statuses=[s for s in statuses if s.get("field")=="45403" and
+                       isinstance(s.get("resolved_path"),str) and
+                       ntpath.normcase(ntpath.normpath(s["resolved_path"]))==ntpath.normcase(ntpath.normpath(str(original)))]
+    if not original_statuses or any(s.get("status") not in {"exists","missing"} for s in original_statuses):
+        counts["video_cover_targets.excluded_unknown_original_status"]+=1
+        return
+    if any(s.get("status")=="exists" and s.get("size")!=size for s in original_statuses):
+        counts["video_cover_targets.excluded_original_size_mismatch"]+=1
+        return
+    cover_statuses=[s for s in statuses if s.get("field")=="45404" and
+                    isinstance(s.get("resolved_path"),str) and
+                    ntpath.normcase(ntpath.normpath(s["resolved_path"]))==ntpath.normcase(ntpath.normpath(str(target)))]
+    if not cover_statuses or any(s.get("status") not in {"exists","missing"} for s in cover_statuses):
+        counts["video_cover_targets.excluded_unknown_declared_cover_status"]+=1
+        return
+    # Reject existing reparse points in the mapped source or target parents.
+    unsafe=False
+    for candidate in (original,target):
+        current=account
+        for component in candidate.relative_to(account).parts:
+            current=current/component
+            try:
+                info=current.lstat()
+                if stat.S_ISLNK(info.st_mode) or bool(getattr(info,"st_file_attributes",0)&0x400):
+                    unsafe=True;break
+            except FileNotFoundError:
+                continue
+            except OSError:
+                unsafe=True;break
+        if unsafe:break
+    if unsafe:
+        counts["video_cover_targets.excluded_reparse_path"]+=1
+        return
+    target_s=str(target);original_s=str(original)
+    if out.execute("SELECT 1 FROM blocked_restore_paths WHERE path IN (?,?)",(target_s,original_s)).fetchone():
+        counts["video_cover_targets.blocked_path"]+=1
+        return
+    if out.execute("SELECT 1 FROM restore_target_conflicts WHERE path IN (?,?)",(target_s,original_s)).fetchone():
+        counts["video_cover_targets.blocked_path"]+=1
+        return
+    prior=out.execute("SELECT source_id,original_path,expected_size,expected_md5 FROM video_cover_targets WHERE target_path=?",(target_s,)).fetchone()
+    if prior:
+        if (prior[0],prior[1],prior[2],str(prior[3]).casefold())==(source_id,original_s,size,md5.casefold()):
+            counts["video_cover_targets.repeated_same_source"]+=1
+            return
+        out.execute("DELETE FROM video_cover_targets WHERE target_path=?",(target_s,))
+        out.execute("INSERT OR IGNORE INTO blocked_restore_paths VALUES (?,?)",(target_s,"conflicting_video_cover_sources"))
+        out.execute("INSERT INTO restore_target_conflicts VALUES (?,?,?,?,?,?)",
+                    (target_s,prior[0],source_id,table_code,mid,compact(record["segment_path"])))
+        counts["video_cover_targets.conflicting_paths"]+=1
+        return
+    out.execute("INSERT INTO video_cover_targets VALUES (?,?,?,?,?,?,?,?)",
+                (target_s,original_s,source_id,table_code,mid,compact(record["segment_path"]),size,md5.lower()))
+    counts["video_cover_targets.added"]+=1
+    # The 45404 cache path is mandatory evidence; no path is inferred from Ori.
 
 
 def scan(args):
@@ -393,6 +519,7 @@ def scan(args):
                                 counts["unique_verified_sources"] += int(cur.rowcount == 1)
                                 sid = out.execute("SELECT source_id FROM verified_sources WHERE size=? AND md5=?", cache_key).fetchone()[0]
                                 save_restore_targets(out, record, statuses, sid, table_code, mid, roots[0], counts)
+                                save_video_cover_targets(out, record, statuses, sid, table_code, mid, roots[0], counts)
                                 out.execute("INSERT OR REPLACE INTO verified_refs VALUES (?,?,?,?,?,?,?,?,?,?)",
                                             (table_code, mid, compact(record["segment_path"]), sid,
                                              str(peer_value) if peer_value is not None else None,
